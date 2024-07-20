@@ -78,6 +78,13 @@ type Mutex struct {
 	mu sync.Mutex
 }
 
+type deadline struct {
+	ptr       interface{}
+	stack     []uintptr
+	currentID int64
+	deadline  time.Time
+}
+
 // Lock locks the mutex.
 // If the lock is already in use, the calling goroutine
 // blocks until the mutex is available.
@@ -180,82 +187,101 @@ func lock(lockFn func(), ptr interface{}) {
 	if Opts.DeadlockTimeout <= 0 {
 		lockFn()
 	} else {
-		ch := make(chan struct{})
 		currentID := goid.Get()
-		go checkDeadlock(stack, ptr, currentID, ch)
+		addDeadline(stack, ptr, currentID)
 		lockFn()
+		removeDeadline(ptr)
 		postLock(stack, ptr)
-		close(ch)
 		return
 	}
 	postLock(stack, ptr)
 }
 
-var timersPool sync.Pool
+var deadlineChannel = make(chan deadline)
 
-func acquireTimer(d time.Duration) *time.Timer {
-	t, ok := timersPool.Get().(*time.Timer)
-	if ok {
-		_ = t.Reset(d)
-		return t
+func addDeadline(stack []uintptr, ptr interface{}, currentID int64) {
+	deadlineChannel <- deadline{
+		ptr:       ptr,
+		stack:     stack,
+		currentID: currentID,
+		deadline:  time.Now().Add(Opts.DeadlockTimeout),
 	}
-	return time.NewTimer(Opts.DeadlockTimeout)
 }
 
-func releaseTimer(t *time.Timer) {
-	if !t.Stop() {
-		<-t.C
+func removeDeadline(ptr interface{}) {
+	deadlineChannel <- deadline{
+		ptr:      ptr,
+		deadline: time.Time{},
 	}
-	timersPool.Put(t)
 }
 
-func checkDeadlock(stack []uintptr, ptr interface{}, currentID int64, ch <-chan struct{}) {
-	t := acquireTimer(Opts.DeadlockTimeout)
-	defer releaseTimer(t)
+func deadlineDetector() {
+	timer := time.NewTimer(0)
+	next := time.Time{}
+	locks := make(map[interface{}]deadline)
+
 	for {
 		select {
-		case <-t.C:
-			lo.mu.Lock()
-			prev, ok := lo.cur[ptr]
-			if !ok {
-				lo.mu.Unlock()
-				break // Nobody seems to be holding the lock, try again.
-			}
-			Opts.mu.Lock()
-			fmt.Fprintln(Opts.LogBuf, header)
-			fmt.Fprintln(Opts.LogBuf, "Previous place where the lock was grabbed")
-			fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", prev.gid, ptr)
-			printStack(Opts.LogBuf, prev.stack)
-			fmt.Fprintln(Opts.LogBuf, "Have been trying to lock it again for more than", Opts.DeadlockTimeout)
-			fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", currentID, ptr)
-			printStack(Opts.LogBuf, stack)
-			stacks := stacks()
-			grs := bytes.Split(stacks, []byte("\n\n"))
-			for _, g := range grs {
-				if goid.ExtractGID(g) == prev.gid {
-					fmt.Fprintln(Opts.LogBuf, "Here is what goroutine", prev.gid, "doing now")
-					Opts.LogBuf.Write(g)
-					fmt.Fprintln(Opts.LogBuf)
+		case d := <-deadlineChannel:
+			if d.deadline.IsZero() {
+				delete(locks, d.ptr)
+			} else {
+				if _, ok := locks[d.ptr]; !ok {
+					locks[d.ptr] = d
+				}
+				if next.IsZero() || next.After(d.deadline) {
+					next = d.deadline
+					timer.Reset(next.Sub(time.Now()))
 				}
 			}
-			lo.other(ptr)
-			if Opts.PrintAllCurrentGoroutines {
-				fmt.Fprintln(Opts.LogBuf, "All current goroutines:")
-				Opts.LogBuf.Write(stacks)
+		case now := <-timer.C:
+			next = time.Time{}
+			for _, l := range locks {
+				if now.After(l.deadline) {
+					lo.mu.Lock()
+					prev, ok := lo.cur[l.ptr]
+					if !ok {
+						lo.mu.Unlock()
+						delete(locks, l.ptr)
+						continue // Nobody seems to be holding the lock, try again.
+					}
+					Opts.mu.Lock()
+					fmt.Fprintln(Opts.LogBuf, header)
+					fmt.Fprintln(Opts.LogBuf, "Previous place where the lock was grabbed")
+					fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", prev.gid, l.ptr)
+					printStack(Opts.LogBuf, prev.stack)
+					fmt.Fprintln(Opts.LogBuf, "Have been trying to lock it again for more than", Opts.DeadlockTimeout)
+					fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", l.currentID, l.ptr)
+					printStack(Opts.LogBuf, l.stack)
+					allStacks := stacks()
+					grs := bytes.Split(allStacks, []byte("\n\n"))
+					for _, g := range grs {
+						if goid.ExtractGID(g) == prev.gid {
+							fmt.Fprintln(Opts.LogBuf, "Here is what goroutine", prev.gid, "doing now")
+							Opts.LogBuf.Write(g)
+							fmt.Fprintln(Opts.LogBuf)
+						}
+					}
+					lo.other(l.ptr)
+					if Opts.PrintAllCurrentGoroutines {
+						fmt.Fprintln(Opts.LogBuf, "All current goroutines:")
+						Opts.LogBuf.Write(allStacks)
+					}
+					fmt.Fprintln(Opts.LogBuf)
+					if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
+						buf.Flush()
+					}
+					Opts.mu.Unlock()
+					lo.mu.Unlock()
+					Opts.OnPotentialDeadlock()
+				} else if next.IsZero() || next.After(l.deadline) {
+					next = l.deadline
+				}
 			}
-			fmt.Fprintln(Opts.LogBuf)
-			if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
-				buf.Flush()
+			if !next.IsZero() {
+				timer.Reset(next.Sub(now))
 			}
-			Opts.mu.Unlock()
-			lo.mu.Unlock()
-			Opts.OnPotentialDeadlock()
-			<-ch
-			return
-		case <-ch:
-			return
 		}
-		t.Reset(Opts.DeadlockTimeout)
 	}
 }
 
@@ -385,3 +411,7 @@ func (l *lockOrder) other(ptr interface{}) {
 }
 
 const header = "POTENTIAL DEADLOCK:"
+
+func init() {
+	go deadlineDetector()
+}
